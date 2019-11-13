@@ -712,7 +712,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-t", "--transfer_source", required=True)
     parser.add_argument("-d", "--depth", type=int, default=1)
-    parser.add_argument("-c", "--config-file", default=None)
+    parser.add_argument("-c", "--config_file", default=None)
     parser.add_argument("--transfer_type", choices=["standard", "unzipped bag"])
     args = parser.parse_args()
 
