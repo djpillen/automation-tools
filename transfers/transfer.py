@@ -589,7 +589,7 @@ def main(
     delete_on_complete=False,
     config_file=None,
     log_level="INFO",
-    settings=settings,
+    settings={},
 ):
     """Primary entry point for the automation tools script."""
     loggingconfig.setup(
