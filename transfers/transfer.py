@@ -9,6 +9,7 @@ Helper script to automate running transfers through Archivematica.
 
 from __future__ import print_function, unicode_literals
 
+import argparse
 import ast
 import atexit
 import base64
@@ -28,9 +29,9 @@ from sqlalchemy.orm.exc import NoResultFound
 # by ensuring that it can see itself.
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from transfers import defaults, errors, loggingconfig, models, utils
-from transfers.transferargs import get_parser
+from transfers import errors, loggingconfig, models, utils
 from transfers.utils import fsencode, fsdecode
+from transfers.config import parse_config
 
 # Directory for various processing decisions, below.
 THIS_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -51,10 +52,10 @@ def manage_automation_execution(pid_file):
     models.cleanup_session()
 
 
-def create_db_session(config_file):
+def create_db_session(config_file, settings):
     """Create and return a database session."""
     models.init_session(
-        get_setting(config_file, "databasefile", os.path.join(THIS_DIR, "transfers.db"))
+        get_setting(config_file, "databasefile", settings.get("databasefile"))
     )
     return models.Session()
 
@@ -214,7 +215,7 @@ def get_accession_id(dirname):
         return None
 
 
-def run_pre_transfer_scripts(config_file, transfer_path, transfer_type):
+def run_pre_transfer_scripts(config_file, transfer_path, transfer_type, settings):
     """Wrapper for the run_scripts function. Pre-transfer functions want to
     modify the transfer itself, therefore the transfer path sent by the
     calling function function should at least be a valid one. If run_scripts
@@ -224,10 +225,10 @@ def run_pre_transfer_scripts(config_file, transfer_path, transfer_type):
     if not os.path.exists(transfer_path):
         LOGGER.error("Invalid transfer path for the pre-transfer scripts to work with")
     else:
-        run_scripts("pre-transfer", config_file, transfer_path, transfer_type)
+        run_scripts("pre-transfer", config_file, settings, transfer_path, transfer_type)
 
 
-def run_scripts(directory, config_file, *args):
+def run_scripts(directory, config_file, settings, *args):
     """
     Run all executable scripts in directory relative to this file.
 
@@ -241,7 +242,7 @@ def run_scripts(directory, config_file, *args):
         return
     script_args = list(args)
     LOGGER.debug("script_args: %s", script_args)
-    script_extensions = get_setting(config_file, "scriptextensions", "").split(":")
+    script_extensions = get_setting(config_file, "scriptextensions", settings.get("scriptextensions")).split(":")
     LOGGER.debug("script_extensions: %s", script_extensions)
     for script in sorted(os.listdir(directory)):
         LOGGER.debug("Script: %s", script)
@@ -400,6 +401,16 @@ def call_start_transfer_endpoint(
         return None, None
 
 
+def copy_default_config(transfer_path, default_config):
+    if not os.path.exists(transfer_path):
+        LOGGER.error("Invalid transfer path to copy default config: %s", transfer_path)
+    elif not os.path.exists(default_config):
+        LOGGER.error("Invalid default config path: %s", default_config)
+    else:
+        destination = os.path.join(transfer_path, "processingMCP.xml")
+        shutil.copyfile(default_config, destination)
+
+
 def start_transfer(
     ss_url,
     ss_user,
@@ -413,6 +424,7 @@ def start_transfer(
     transfer_type,
     see_files,
     config_file,
+    settings,
 ):
     """
     Starts a new transfer.
@@ -455,8 +467,25 @@ def start_transfer(
         return None
     LOGGER.info("Starting with %s", target)
     # Get accession ID
-    accession = get_accession_id(target)
+    accession = get_setting(config_file, "accession", "")
     LOGGER.info("Accession ID: %s", accession)
+    # Run all pre-transfer scripts on the unapproved transfer directory.
+    local_transfer_path = os.path.join(settings.get("ts_local_path"), target.decode("utf8"))
+    processing_config = settings["processing_config"]
+    LOGGER.info("Attempting to copy default config on: %s", local_transfer_path)
+    copy_default_config(local_transfer_path, processing_config)
+    LOGGER.info("Attempting to run pre-transfer scripts on: %s", local_transfer_path)
+    try:
+        run_pre_transfer_scripts(
+            config_file=config_file,
+            transfer_path=local_transfer_path,
+            transfer_type=transfer_type,
+            settings=settings
+        )
+    except OSError as err:
+        LOGGER.error("Failed to run pre-transfer scripts: %s", err)
+        return None
+
     # Call the start transfer endpoint.
     # Retrieve the directory name for Archivematica.
     transfer_name, transfer_abs_path = call_start_transfer_endpoint(
@@ -472,17 +501,7 @@ def start_transfer(
         LOGGER.info("Cannot begin transfer with target name: %s", target)
         models.transfer_failed_to_start(target)
         return None
-    # Run all pre-transfer scripts on the unapproved transfer directory.
-    LOGGER.info("Attempting to run pre-transfer scripts on: %s", transfer_name)
-    try:
-        run_pre_transfer_scripts(
-            config_file=config_file,
-            transfer_path=transfer_abs_path,
-            transfer_type=transfer_type,
-        )
-    except OSError as err:
-        LOGGER.error("Failed to run pre-transfer scripts: %s", err)
-        return None
+
     # Approve transfer.
     LOGGER.info("Ready to approve transfer")
     retry_count = 3
@@ -570,17 +589,17 @@ def main(
     delete_on_complete=False,
     config_file=None,
     log_level="INFO",
+    settings=settings,
 ):
     """Primary entry point for the automation tools script."""
     loggingconfig.setup(
-        log_level, get_setting(config_file, "logfile", defaults.TRANSFER_LOG_FILE)
+        log_level, get_setting(config_file, "logfile", settings.get("logfile"))
     )
 
     LOGGER.info("Automation tools waking up")
 
     # Check for evidence that this is already running
-    default_pidfile = os.path.join(THIS_DIR, "pid.lck")
-    pid_file = get_setting(config_file, "pidfile", default_pidfile)
+    pid_file = get_setting(config_file, "pidfile", settings.get("pidfile"))
     try:
         # Open PID file only if it doesn't exist for read/write
         f = os.fdopen(os.open(pid_file, os.O_CREAT | os.O_EXCL | os.O_RDWR), "w")
@@ -597,7 +616,7 @@ def main(
         f.close()
 
     # Create a database session to work with.
-    create_db_session(config_file)
+    create_db_session(config_file, settings)
 
     # Create the callback to automatically remove pid.lck on script completion.
     setup_automation_execution(pid_file=pid_file)
@@ -654,6 +673,7 @@ def main(
         run_scripts(
             "user-input",
             config_file,
+            settings,
             microservice,  # Current microservice name
             # String True or False if this is the first time at this prompt
             str(microservice != current_unit.microservice),
@@ -681,32 +701,46 @@ def main(
         transfer_type,
         see_files,
         config_file,
+        settings,
     )
     return 0 if new_transfer else 1
 
 
-if __name__ == "__main__":
-    parser = get_parser(__doc__)
+if __name__ == "__main__":    
+    settings = parse_config()
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-t", "--transfer_source", required=True)
+    parser.add_argument("-d", "--depth", type=int, default=1)
+    parser.add_argument("-c", "--config-file", default=None)
+    parser.add_argument("--transfer_type", choices=["standard", "unzipped bag"])
     args = parser.parse_args()
 
-    log_level = loggingconfig.set_log_level(args.log_level, args.quiet, args.verbose)
+    if args.transfer_type:
+        settings["transfer_type"] = args.transfer_type
+
+    transfer_source_name = args.transfer_source
+    settings["ts_uuid"] = settings["{}_uuid".format(transfer_source_name)]
+    settings["ts_local_path"] = settings["{}_path".format(transfer_source_name)]
+    log_level = get_setting(args.config_file, "log_level", settings.get("log_level"))
 
     sys.exit(
         main(
-            am_user=args.user,
-            am_api_key=args.api_key,
-            ss_user=args.ss_user,
-            ss_api_key=args.ss_api_key,
-            ts_uuid=args.transfer_source,
-            ts_path=args.transfer_path,
+            am_user=settings["am_user"],
+            am_api_key=settings["am_api_key"],
+            ss_user=settings["ss_user"],
+            ss_api_key=settings["ss_api_key"],
+            ts_uuid=settings["ts_uuid"],
+            ts_path=b"",
             depth=args.depth,
-            am_url=args.am_url,
-            ss_url=args.ss_url,
-            transfer_type=args.transfer_type,
-            see_files=args.files,
-            hide_on_complete=args.hide,
-            delete_on_complete=args.delete_on_complete,
+            am_url=settings["am_url"],
+            ss_url=settings["ss_url"],
+            transfer_type=settings["transfer_type"],
+            see_files=False,
+            hide_on_complete=True,
+            delete_on_complete=False,
             config_file=args.config_file,
             log_level=log_level,
+            settings=settings,
         )
     )
