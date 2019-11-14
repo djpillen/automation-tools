@@ -722,6 +722,9 @@ if __name__ == "__main__":
     transfer_source_name = args.transfer_source
     settings["ts_uuid"] = settings["{}_uuid".format(transfer_source_name)]
     settings["ts_local_path"] = settings["{}_path".format(transfer_source_name)]
+    if not os.path.exists(settings["ts_local_path"]):
+        sys.exit("Configured transfer source local path does not exist: %s", settings["ts_local_path"])
+
     log_level = get_setting(args.config_file, "log_level", settings.get("log_level"))
 
     sys.exit(
